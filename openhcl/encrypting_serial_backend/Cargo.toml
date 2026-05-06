@@ -1,0 +1,30 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "encrypting_serial_backend"
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate transitively depends on openhcl_serial_console_crypto,
+# which is itself Linux-only because the workspace's KDF lives in
+# openssl_kdf (Unix-only). Mirror that gating here so the workspace
+# still builds on Windows / macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+openhcl_serial_console_crypto.workspace = true
+serial_core.workspace = true
+vm_resource.workspace = true
+
+futures.workspace = true
+inspect.workspace = true
+mesh.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
+anyhow.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

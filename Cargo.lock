@@ -1771,6 +1771,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "encrypting_serial_backend"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "getrandom 0.3.3",
+ "inspect",
+ "mesh",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "parking_lot",
+ "serial_core",
+ "thiserror 2.0.16",
+ "tracing",
+ "vm_resource",
+]
+
+[[package]]
 name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
