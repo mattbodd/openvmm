@@ -8,9 +8,9 @@ use crate::handle::EncryptingSerialBackendHandle;
 use crate::io::EncryptingSerialIo;
 use anyhow::Context as _;
 use async_trait::async_trait;
+use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use openhcl_serial_console_crypto::crypto::GksKeyMaterial;
 use openhcl_serial_console_crypto::crypto::derive_aes_key;
-use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use serial_core::resources::ResolveSerialBackendParams;
 use serial_core::resources::ResolvedSerialBackend;
 use vm_resource::AsyncResolveResource;
@@ -66,7 +66,10 @@ impl AsyncResolveResource<SerialBackendHandle, EncryptingSerialBackendHandle>
         // lifetime contraction rather than a zeroize), but making
         // the discard explicit guards future refactors against
         // accidentally retaining the secret past key derivation.
-        #[expect(clippy::drop_non_drop, reason = "explicit lifetime contraction for the secret GKS bytes")]
+        #[expect(
+            clippy::drop_non_drop,
+            reason = "explicit lifetime contraction for the secret GKS bytes"
+        )]
         drop(gks);
 
         let wrapper = EncryptingSerialIo::new(inner_io, aes_key, session_id);

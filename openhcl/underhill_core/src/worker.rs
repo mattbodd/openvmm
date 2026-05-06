@@ -2340,28 +2340,29 @@ async fn new_underhill_vm(
     // we leave the corresponding L1 serial slot empty and emit a
     // CVM_ALLOWED error. The L1 guest sees no COM port at all
     // rather than an unintentional plaintext fallback.
-    let serial_gks: Option<[u8; openhcl_serial_console_crypto::crypto::GKS_LEN]> = if encrypt_l1_serial {
-        match platform_attestation_data.guest_secret_key.as_deref() {
-            Some(bytes) if !bytes.is_empty() => {
-                let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
-                let copy_len = bytes.len().min(buf.len());
-                buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                Some(buf)
-            }
-            _ => {
-                tracing::error!(
-                    CVM_ALLOWED,
-                    "Encrypted L1 serial console requested for this CVM but no GuestSecretKey \
+    let serial_gks: Option<[u8; openhcl_serial_console_crypto::crypto::GKS_LEN]> =
+        if encrypt_l1_serial {
+            match platform_attestation_data.guest_secret_key.as_deref() {
+                Some(bytes) if !bytes.is_empty() => {
+                    let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+                    let copy_len = bytes.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                    Some(buf)
+                }
+                _ => {
+                    tracing::error!(
+                        CVM_ALLOWED,
+                        "Encrypted L1 serial console requested for this CVM but no GuestSecretKey \
                      is available; L1 COM ports will be DISABLED rather than fall back to \
                      plaintext on the wire. Provision a GUEST_SECRET_KEY entry in the VMGS \
                      to enable encrypted serial."
-                );
-                None
+                    );
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Local helper: wrap the inner vmbus serial config in the
     // encrypting backend handle when the policy says we should, and

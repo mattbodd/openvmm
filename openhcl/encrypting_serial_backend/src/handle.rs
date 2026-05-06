@@ -4,8 +4,8 @@
 //! Resource-layer plumbing: the [`EncryptingSerialBackendHandle`]
 //! mesh-payload type and its [`ResourceId`] registration.
 
-use openhcl_serial_console_crypto::crypto::GKS_LEN;
 use mesh::MeshPayload;
+use openhcl_serial_console_crypto::crypto::GKS_LEN;
 use vm_resource::Resource;
 use vm_resource::ResourceId;
 use vm_resource::kind::SerialBackendHandle;

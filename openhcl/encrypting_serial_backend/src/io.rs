@@ -569,7 +569,10 @@ mod tests {
     #[async_test]
     async fn reads_pass_through_inner() {
         let (inner, captured) = FakeInner::new();
-        captured.lock().read_buf.extend(b"host typed this".iter().copied());
+        captured
+            .lock()
+            .read_buf
+            .extend(b"host typed this".iter().copied());
         let (aes_key, session_id) = sample_keys();
         let mut wrapper = EncryptingSerialIo::new(Box::new(inner), aes_key, session_id);
 
@@ -587,7 +590,9 @@ mod tests {
 
         // Fill the plaintext buffer (no newline => no emit yet).
         let half = vec![b'x'; MAX_PLAINTEXT_LEN];
-        let n = poll_fn(|cx| Pin::new(&mut wrapper).poll_write(cx, &half)).await.unwrap();
+        let n = poll_fn(|cx| Pin::new(&mut wrapper).poll_write(cx, &half))
+            .await
+            .unwrap();
         assert_eq!(n, MAX_PLAINTEXT_LEN);
 
         // Trigger an emit by writing a newline. Now there's an
@@ -625,6 +630,9 @@ mod tests {
         let captured_bytes = captured.lock().written.clone();
         // Decrypting must succeed on at least one record.
         let plain = decrypt_capture(&captured_bytes, &aes_key);
-        assert!(!plain.is_empty(), "expected at least one decryptable record");
+        assert!(
+            !plain.is_empty(),
+            "expected at least one decryptable record"
+        );
     }
 }
