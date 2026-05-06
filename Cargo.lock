@@ -5163,6 +5163,7 @@ dependencies = [
  "crypto",
  "hex",
  "thiserror 2.0.16",
+ "tpm_protocol",
 ]
 
 [[package]]

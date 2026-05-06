@@ -12,6 +12,7 @@ rust-version.workspace = true
 # crate to Linux to keep the workspace buildable everywhere else.
 [target.'cfg(target_os = "linux")'.dependencies]
 crypto.workspace = true
+tpm_protocol.workspace = true
 
 base64.workspace = true
 thiserror.workspace = true
