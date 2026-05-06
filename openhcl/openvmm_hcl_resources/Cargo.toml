@@ -20,6 +20,7 @@ vmsocket = { workspace = true, optional = true }
 
 serial_core.workspace = true
 vmbus_serial_guest.workspace = true
+encrypting_serial_backend.workspace = true
 
 disk_striped.workspace = true
 
