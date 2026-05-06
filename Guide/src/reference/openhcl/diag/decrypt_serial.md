@@ -96,8 +96,20 @@ the same crate, ensuring byte-for-byte compatibility.
 decrypt-serial --input <PATH> [--output <PATH>] (--key <PATH> | --vmgs <PATH>) [--strict]
 ```
 
-The most common flow extracts the GKS from the VM's VMGS file with
-`vmgstool` and then feeds it to `decrypt-serial`:
+`<PATH>` may be a regular file or a named pipe (FIFO). When reading
+from a FIFO, `decrypt-serial` streams each record to its output as
+soon as it arrives -- you don't have to wait for the writer to close
+the pipe to see decrypted output. This is the recommended way to
+watch a live VM:
+
+```sh
+mkfifo /tmp/com1.pipe
+decrypt-serial --vmgs my_vm.vmgs --input /tmp/com1.pipe &
+openvmm ... --vmbus-com1-serial "file=/tmp/com1.pipe"
+```
+
+The most common one-shot flow extracts the GKS from the VM's VMGS
+file with `vmgstool` and then feeds it to `decrypt-serial`:
 
 ```sh
 # 1. Extract GUEST_SECRET_KEY (FileId 13) out of the VMGS file.

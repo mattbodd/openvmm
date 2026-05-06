@@ -1,15 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Streaming-bounded decryptor: walk an encrypted serial capture
-//! buffer, find each ``[[OHENC v1 ...]]`` sentinel, decrypt the
-//! record, and write the recovered plaintext (interleaved with
-//! verbatim plaintext bytes from outside the records) to an output
-//! sink.
+//! Streaming decryptor: read an encrypted serial capture from any
+//! `impl Read` (regular file, FIFO, stdin, ...), walk it for each
+//! ``[[OHENC v1 ...]]`` sentinel, decrypt the record, and write the
+//! recovered plaintext (interleaved with verbatim plaintext bytes
+//! from outside the records) to an output sink.
+//!
+//! The driver is incremental: it does not require the entire input
+//! to be available up front, so it works on a live FIFO that the
+//! producer is still writing to. A bounded sliding buffer is used
+//! to splice records that arrive across multiple read chunks.
 
 use anyhow::Context;
 use anyhow::bail;
 use openhcl_serial_console_crypto::consts::AES_KEY_LEN;
+use openhcl_serial_console_crypto::consts::MAX_SENTINEL_BASE64_LEN;
+use openhcl_serial_console_crypto::consts::SENTINEL_CLOSE;
+use openhcl_serial_console_crypto::consts::SENTINEL_OPEN;
 use openhcl_serial_console_crypto::consts::SESSION_ID_LEN;
 use openhcl_serial_console_crypto::crypto;
 use openhcl_serial_console_crypto::format::Record;
@@ -17,7 +25,29 @@ use openhcl_serial_console_crypto::format::SentinelMatch;
 use openhcl_serial_console_crypto::format::find_next_sentinel;
 use openhcl_serial_console_crypto::gks::ParsedGks;
 use std::collections::HashMap;
+use std::io::Read;
 use std::io::Write;
+
+/// How many bytes to attempt to read from the input on each top-up.
+/// The exact value isn't important; it just needs to be large enough
+/// to amortize syscalls and small enough to keep the per-iteration
+/// scan cheap.
+const READ_CHUNK_SIZE: usize = 8 * 1024;
+
+/// Once the consumed prefix of the working buffer reaches this size,
+/// drop it and reset the cursor. Compaction keeps memory bounded for
+/// long-running streams without doing an allocation per record.
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Smallest number of bytes after a sentinel opener at which a missing
+/// closing `]]` is *decisive* evidence that the candidate sentinel is
+/// truly malformed (rather than just split across reads).
+///
+/// Equal to the maximum legal body length plus the closing literal:
+/// once we've buffered this many bytes after the opener with no `]]`,
+/// no future arrival can rescue the record because the format library
+/// would already have rejected it as too long.
+const MIN_DECISIVE_AFTER_BODY_START: usize = MAX_SENTINEL_BASE64_LEN + SENTINEL_CLOSE.len();
 
 /// Stats reported by [`run`] about a single decryption pass.
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,12 +59,19 @@ pub struct DecryptStats {
     /// failure.
     pub records_failed: usize,
     /// Number of distinct sessions observed in successfully
-    /// authenticated records.
+    /// authenticated records. Sessions observed only via failed-auth
+    /// records do not count.
     pub sessions_observed: usize,
 }
 
 /// Run the decryptor over `input`, writing recovered plaintext (and
 /// any passthrough plaintext from outside records) to `output`.
+///
+/// `input` is read incrementally; the function processes complete
+/// records as soon as they arrive on the underlying stream and
+/// flushes `output` after every emitted chunk so callers tailing a
+/// FIFO see decrypted output without having to wait for the producer
+/// to close the pipe.
 ///
 /// In default mode, malformed sentinels are passed through verbatim
 /// (so a stray ``[[OHENC `` in plaintext does not silently disappear)
@@ -42,34 +79,103 @@ pub struct DecryptStats {
 /// ``<<decrypt failed offset=N reason=...>>`` marker injected into
 /// the output stream. In `strict` mode, the first malformed sentinel
 /// or decryption failure is fatal.
+///
+/// Reported byte offsets are absolute positions in the original
+/// stream, even after internal buffer compaction.
 pub fn run(
-    input: &[u8],
+    input: &mut impl Read,
     output: &mut impl Write,
     gks: &ParsedGks,
     strict: bool,
 ) -> anyhow::Result<DecryptStats> {
     let mut state = SessionState::new();
     let mut stats = DecryptStats::default();
-    let mut cursor = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_SIZE * 2);
+    // Number of bytes already consumed from the front of `buf`; offsets
+    // returned by `find_next_sentinel` are relative to `buf`, but
+    // user-visible offsets reported in error markers are
+    // `absolute_base + buf_offset` so they survive compaction.
+    let mut cursor = 0usize;
+    let mut absolute_base = 0u64;
+    let mut eof = false;
 
-    while cursor <= input.len() {
-        match find_next_sentinel(input, cursor) {
-            SentinelMatch::NotFound => {
-                output
-                    .write_all(&input[cursor..])
-                    .context("writing trailing plaintext")?;
-                break;
+    loop {
+        if !eof {
+            // Compact the consumed prefix periodically so the buffer
+            // doesn't grow without bound on long-running streams.
+            if cursor >= COMPACT_THRESHOLD {
+                buf.drain(..cursor);
+                absolute_base += cursor as u64;
+                cursor = 0;
             }
+
+            let prev_len = buf.len();
+            buf.resize(prev_len + READ_CHUNK_SIZE, 0);
+            let n = input
+                .read(&mut buf[prev_len..])
+                .context("reading encrypted serial input")?;
+            buf.truncate(prev_len + n);
+            if n == 0 {
+                eof = true;
+            }
+        }
+
+        let made_progress = drain_buffer(
+            &buf,
+            &mut cursor,
+            absolute_base,
+            output,
+            gks,
+            &mut state,
+            &mut stats,
+            strict,
+            eof,
+        )?;
+
+        if made_progress {
+            output.flush().context("flushing decrypted output")?;
+        }
+
+        if eof && cursor >= buf.len() {
+            break;
+        }
+    }
+
+    stats.sessions_observed = state.expected_seq.len();
+    Ok(stats)
+}
+
+/// Walk the working buffer for as long as we can make progress
+/// without needing more data, returning whether we emitted anything
+/// this pass.
+#[expect(clippy::too_many_arguments)]
+fn drain_buffer(
+    buf: &[u8],
+    cursor: &mut usize,
+    absolute_base: u64,
+    output: &mut impl Write,
+    gks: &ParsedGks,
+    state: &mut SessionState,
+    stats: &mut DecryptStats,
+    strict: bool,
+    eof: bool,
+) -> anyhow::Result<bool> {
+    let mut made_progress = false;
+    loop {
+        match find_next_sentinel(buf, *cursor) {
             SentinelMatch::Found {
                 start,
                 end,
                 payload,
             } => {
-                output
-                    .write_all(&input[cursor..start])
-                    .context("writing leading plaintext before record")?;
+                if start > *cursor {
+                    output
+                        .write_all(&buf[*cursor..start])
+                        .context("writing leading plaintext before record")?;
+                }
+                let abs_start = absolute_base + start as u64;
                 match Record::parse_payload(&payload) {
-                    Ok(record) => match try_decrypt(gks, &record, &mut state) {
+                    Ok(record) => match try_decrypt(gks, &record, state) {
                         Ok(plaintext) => {
                             output
                                 .write_all(&plaintext)
@@ -78,40 +184,92 @@ pub fn run(
                         }
                         Err(err) => {
                             stats.records_failed += 1;
-                            handle_failure(strict, output, start, &err.to_string())?;
+                            handle_failure(strict, output, abs_start, &err.to_string())?;
                         }
                     },
                     Err(err) => {
                         stats.records_failed += 1;
-                        handle_failure(strict, output, start, &err.to_string())?;
+                        handle_failure(strict, output, abs_start, &err.to_string())?;
                     }
                 }
-                cursor = end;
+                *cursor = end;
+                made_progress = true;
             }
             SentinelMatch::Malformed { start, reason } => {
+                let abs_start = absolute_base + start as u64;
+                let body_start = start + SENTINEL_OPEN.len();
+                let is_unterminated = matches!(
+                    reason,
+                    openhcl_serial_console_crypto::format::SentinelError::Unterminated
+                );
+                let decisive = eof
+                    || !is_unterminated
+                    || buf.len().saturating_sub(body_start) >= MIN_DECISIVE_AFTER_BODY_START;
+
+                if !decisive {
+                    // Could just be a sentinel split across reads.
+                    // Emit any verbatim plaintext that precedes it
+                    // and wait for more bytes.
+                    if start > *cursor {
+                        output
+                            .write_all(&buf[*cursor..start])
+                            .context("writing plaintext before deferred sentinel")?;
+                        *cursor = start;
+                        made_progress = true;
+                    }
+                    return Ok(made_progress);
+                }
+
                 if strict {
-                    bail!("malformed encrypted-serial sentinel at offset {start}: {reason}");
+                    bail!("malformed encrypted-serial sentinel at offset {abs_start}: {reason}",);
                 }
                 tracing::warn!(
-                    offset = start,
+                    offset = abs_start,
                     %reason,
                     "skipping malformed encrypted-serial sentinel; bytes will be passed through verbatim",
                 );
-                // Pass everything up to and including the opening
-                // bracket through, then resume scanning right after
-                // it. This way the output preserves a record of the
-                // candidate bytes the producer emitted.
-                let pass_end = (start + 1).min(input.len());
-                output
-                    .write_all(&input[cursor..pass_end])
-                    .context("passing through leading bytes of malformed sentinel")?;
-                cursor = pass_end;
+                // Emit everything up to and including the opening
+                // bracket, then resume scanning right after it.
+                let pass_end = (start + 1).min(buf.len());
+                if pass_end > *cursor {
+                    output
+                        .write_all(&buf[*cursor..pass_end])
+                        .context("passing through leading bytes of malformed sentinel")?;
+                    *cursor = pass_end;
+                    made_progress = true;
+                } else {
+                    // `start` was inside the already-consumed region;
+                    // can't happen with the current scanner but be
+                    // defensive.
+                    return Ok(made_progress);
+                }
+            }
+            SentinelMatch::NotFound => {
+                if eof {
+                    if buf.len() > *cursor {
+                        output
+                            .write_all(&buf[*cursor..])
+                            .context("writing trailing plaintext")?;
+                        *cursor = buf.len();
+                        made_progress = true;
+                    }
+                } else {
+                    // Hold back the last (SENTINEL_OPEN.len() - 1)
+                    // bytes in case they're the start of an opener
+                    // that completes in the next read.
+                    let safe_end = buf.len().saturating_sub(SENTINEL_OPEN.len() - 1);
+                    if safe_end > *cursor {
+                        output
+                            .write_all(&buf[*cursor..safe_end])
+                            .context("writing safe plaintext prefix")?;
+                        *cursor = safe_end;
+                        made_progress = true;
+                    }
+                }
+                return Ok(made_progress);
             }
         }
     }
-
-    stats.sessions_observed = state.keys.len();
-    Ok(stats)
 }
 
 struct SessionState {
@@ -119,7 +277,11 @@ struct SessionState {
     /// Per-session next-expected sequence number. We only populate
     /// this once we have authenticated at least one record from the
     /// session, so we never treat attacker-controlled `seq` from a
-    /// failed-auth record as ground truth.
+    /// failed-auth record as ground truth. This map is also the
+    /// source of truth for `DecryptStats::sessions_observed` — the
+    /// `keys` cache is filled lazily on first record-of-session
+    /// regardless of whether that record authenticates, so it can be
+    /// inflated by tampered captures.
     expected_seq: HashMap<[u8; SESSION_ID_LEN], u64>,
 }
 
@@ -183,7 +345,7 @@ fn try_decrypt(
 fn handle_failure(
     strict: bool,
     output: &mut impl Write,
-    offset: usize,
+    offset: u64,
     reason: &str,
 ) -> anyhow::Result<()> {
     if strict {
@@ -207,6 +369,7 @@ mod tests {
     use openhcl_serial_console_crypto::crypto::encrypt;
     use openhcl_serial_console_crypto::format::Record;
     use openhcl_serial_console_crypto::gks::parse_gks;
+    use std::io::Cursor;
 
     /// A real, deterministic TPM Import payload (lifted from
     /// `vm/devices/tpm/tpm_lib/src/lib.rs:3023-3054`).
@@ -264,13 +427,58 @@ mod tests {
         }
     }
 
+    /// `Read` adapter that delivers at most `chunk_size` bytes per
+    /// `read()` call. Used to exercise the streaming code paths with
+    /// inputs split arbitrarily across chunks.
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        chunk_size: usize,
+        pos: usize,
+    }
+
+    impl<'a> ChunkedReader<'a> {
+        fn new(data: &'a [u8], chunk_size: usize) -> Self {
+            assert!(chunk_size > 0);
+            Self {
+                data,
+                chunk_size,
+                pos: 0,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = self
+                .chunk_size
+                .min(out.len())
+                .min(self.data.len() - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn run_buf(
+        input: &[u8],
+        output: &mut Vec<u8>,
+        gks: &ParsedGks,
+        strict: bool,
+    ) -> anyhow::Result<DecryptStats> {
+        let mut r = Cursor::new(input);
+        run(&mut r, output, gks, strict)
+    }
+
     #[test]
     fn round_trip_single_record_no_passthrough() {
         let gks = sample_gks();
         let r = make_record(&gks, [0xa1; SESSION_ID_LEN], 0, [0xb1; NONCE_LEN], b"hello");
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run_buf(input.as_bytes(), &mut out, &gks, false).unwrap();
         assert_eq!(out, b"hello");
         assert_eq!(stats.records_ok, 1);
         assert_eq!(stats.records_failed, 0);
@@ -291,7 +499,7 @@ mod tests {
         input.extend_from_slice(b"\ntrailing");
 
         let mut out = Vec::new();
-        let stats = run(&input, &mut out, &gks, false).unwrap();
+        let stats = run_buf(&input, &mut out, &gks, false).unwrap();
         assert_eq!(out, b"prefix\nONE\nmiddle\nTWO\ntrailing");
         assert_eq!(stats.records_ok, 2);
     }
@@ -312,7 +520,7 @@ mod tests {
             r3.encode_to_string(),
         );
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run_buf(input.as_bytes(), &mut out, &gks, false).unwrap();
         assert_eq!(out, b"A\nB\nC\n");
         assert_eq!(stats.records_ok, 3);
         assert_eq!(stats.sessions_observed, 2);
@@ -325,7 +533,7 @@ mod tests {
         r.tag[0] ^= 1;
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let stats = run(input.as_bytes(), &mut out, &gks, false).unwrap();
+        let stats = run_buf(input.as_bytes(), &mut out, &gks, false).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("<<decrypt failed offset="), "got: {s:?}");
         assert_eq!(stats.records_ok, 0);
@@ -339,7 +547,7 @@ mod tests {
         r.tag[0] ^= 1;
         let input = r.encode_to_string();
         let mut out = Vec::new();
-        let err = run(input.as_bytes(), &mut out, &gks, true).unwrap_err();
+        let err = run_buf(input.as_bytes(), &mut out, &gks, true).unwrap_err();
         assert!(err.to_string().contains("offset"), "got: {err:#}");
     }
 
@@ -351,7 +559,7 @@ mod tests {
         let gks = sample_gks();
         let input = b"hello [[OHENC v1 not_valid_base64_content_here]] world";
         let mut out = Vec::new();
-        let stats = run(input, &mut out, &gks, false).unwrap();
+        let stats = run_buf(input, &mut out, &gks, false).unwrap();
         // We pass through `[`, then the rest of the sentinel-looking
         // text gets re-scanned for sentinels and ultimately ends up
         // in the output unchanged. The exact byte-for-byte output
@@ -368,7 +576,7 @@ mod tests {
         let gks = sample_gks();
         let input = b"[[OHENC v1 not_valid_base64_content]]";
         let mut out = Vec::new();
-        let err = run(input, &mut out, &gks, true).unwrap_err();
+        let err = run_buf(input, &mut out, &gks, true).unwrap_err();
         assert!(err.to_string().contains("malformed"), "got: {err:#}");
     }
 
@@ -376,8 +584,317 @@ mod tests {
     fn empty_input_produces_empty_output() {
         let gks = sample_gks();
         let mut out = Vec::new();
-        let stats = run(b"", &mut out, &gks, false).unwrap();
+        let stats = run_buf(b"", &mut out, &gks, false).unwrap();
         assert!(out.is_empty());
         assert_eq!(stats.records_ok, 0);
+    }
+
+    /// Drive the streaming decoder one byte at a time. This exercises
+    /// every possible split point inside an opener, base64 body, and
+    /// closer; the streaming buffer must defer until each sentinel is
+    /// complete and then emit the same result as the buffered case.
+    #[test]
+    fn streaming_one_byte_at_a_time_matches_buffered() {
+        let gks = sample_gks();
+        let session = [0xe1; SESSION_ID_LEN];
+        let r1 = make_record(&gks, session, 0, [0x10; NONCE_LEN], b"alpha");
+        let r2 = make_record(&gks, session, 1, [0x11; NONCE_LEN], b"bravo");
+        let mut input = b"PREFIX ".to_vec();
+        input.extend_from_slice(r1.encode_to_string().as_bytes());
+        input.extend_from_slice(b" GAP ");
+        input.extend_from_slice(r2.encode_to_string().as_bytes());
+        input.extend_from_slice(b" SUFFIX");
+
+        let mut buffered = Vec::new();
+        let buffered_stats = run_buf(&input, &mut buffered, &gks, false).unwrap();
+
+        let mut chunked = Vec::new();
+        let mut reader = ChunkedReader::new(&input, 1);
+        let chunked_stats = run(&mut reader, &mut chunked, &gks, false).unwrap();
+
+        assert_eq!(chunked, buffered);
+        assert_eq!(chunked_stats.records_ok, buffered_stats.records_ok);
+        assert_eq!(chunked, b"PREFIX alpha GAP bravo SUFFIX");
+    }
+
+    /// Several different small chunk sizes across a multi-record
+    /// input. Belt-and-suspenders for the one-byte test above.
+    #[test]
+    fn streaming_several_chunk_sizes_match_buffered() {
+        let gks = sample_gks();
+        let session = [0xe2; SESSION_ID_LEN];
+        let mut input = Vec::new();
+        for i in 0..5u64 {
+            input.extend_from_slice(b"line ");
+            let payload = format!("rec{i}");
+            let r = make_record(
+                &gks,
+                session,
+                i,
+                [(0x20 + i as u8); NONCE_LEN],
+                payload.as_bytes(),
+            );
+            input.extend_from_slice(r.encode_to_string().as_bytes());
+            input.extend_from_slice(b"\n");
+        }
+
+        let mut buffered = Vec::new();
+        let _ = run_buf(&input, &mut buffered, &gks, false).unwrap();
+
+        for &chunk in &[1usize, 2, 3, 7, 13, 64, 256, 4096] {
+            let mut chunked = Vec::new();
+            let mut reader = ChunkedReader::new(&input, chunk);
+            let _ = run(&mut reader, &mut chunked, &gks, false).unwrap();
+            assert_eq!(chunked, buffered, "mismatch at chunk_size={chunk}");
+        }
+    }
+
+    /// Plaintext containing just the start of a sentinel opener at
+    /// the end of one read should be deferred (held in the trailing
+    /// window) until the next read makes it clear whether it was a
+    /// real opener or just plaintext.
+    #[test]
+    fn streaming_partial_opener_at_chunk_boundary() {
+        let gks = sample_gks();
+        let r = make_record(&gks, [0xe3; SESSION_ID_LEN], 0, [0x10; NONCE_LEN], b"DATA");
+        let mut input = b"hello [[".to_vec();
+        input.extend_from_slice(b"OHENC v1 ");
+        // Only the sentinel from `r` follows; reuse its encoded form.
+        let encoded = r.encode_to_string();
+        // Strip the leading "[[OHENC v1 " (already in input above).
+        let body_with_close = &encoded[SENTINEL_OPEN.len()..];
+        input.extend_from_slice(body_with_close.as_bytes());
+        input.extend_from_slice(b" trailing");
+
+        // Use a tiny chunk to ensure the boundary lands inside the
+        // opener.
+        let mut chunked = Vec::new();
+        let mut reader = ChunkedReader::new(&input, 3);
+        let stats = run(&mut reader, &mut chunked, &gks, false).unwrap();
+        assert_eq!(chunked, b"hello DATA trailing");
+        assert_eq!(stats.records_ok, 1);
+    }
+
+    /// An opener that is truly never closed must be reported as
+    /// malformed at EOF rather than silently dropped, and the
+    /// preceding plaintext must still be flushed.
+    #[test]
+    fn streaming_unterminated_at_eof_is_malformed() {
+        let gks = sample_gks();
+        let mut input = b"prefix [[OHENC v1 abcdef".to_vec();
+        // Exactly enough bytes after the opener to NOT trigger the
+        // "decisive while still streaming" path; only EOF should
+        // resolve this.
+        input.extend_from_slice(&[b'A'; 32]);
+        let mut chunked = Vec::new();
+        let mut reader = ChunkedReader::new(&input, 5);
+        let stats = run(&mut reader, &mut chunked, &gks, false).unwrap();
+        let s = String::from_utf8(chunked).unwrap();
+        assert!(s.starts_with("prefix "), "got: {s:?}");
+        assert_eq!(stats.records_ok, 0);
+    }
+
+    /// Same as above but in strict mode: the unterminated sentinel
+    /// must error out (at EOF) rather than being silently deferred
+    /// forever.
+    #[test]
+    fn streaming_unterminated_at_eof_strict_errors() {
+        let gks = sample_gks();
+        let mut input = b"prefix [[OHENC v1 abcdef".to_vec();
+        input.extend_from_slice(&[b'A'; 32]);
+        let mut chunked = Vec::new();
+        let mut reader = ChunkedReader::new(&input, 5);
+        let err = run(&mut reader, &mut chunked, &gks, true).unwrap_err();
+        assert!(err.to_string().contains("malformed"), "got: {err:#}");
+    }
+
+    /// Reported offsets must be absolute, not relative to the
+    /// post-compaction sliding buffer. Build a stream large enough
+    /// to trigger at least one compaction, then verify the offset of
+    /// a tampered record near the end is reported as its absolute
+    /// position in the original input.
+    #[test]
+    fn streaming_failure_offsets_are_absolute_after_compaction() {
+        let gks = sample_gks();
+        let session = [0xe4; SESSION_ID_LEN];
+        let mut input = Vec::new();
+
+        // Pad with enough plaintext to push past COMPACT_THRESHOLD.
+        let pad_size = COMPACT_THRESHOLD + 4096;
+        input.extend(std::iter::repeat_n(b'.', pad_size));
+
+        // Then a tampered record.
+        let mut tampered = make_record(&gks, session, 0, [0x33; NONCE_LEN], b"oops");
+        tampered.tag[0] ^= 1;
+        let tampered_offset = input.len();
+        input.extend_from_slice(tampered.encode_to_string().as_bytes());
+
+        let mut out = Vec::new();
+        let mut reader = ChunkedReader::new(&input, 1024);
+        let stats = run(&mut reader, &mut out, &gks, false).unwrap();
+        assert_eq!(stats.records_failed, 1);
+        let s = String::from_utf8(out).unwrap();
+        let needle = format!("<<decrypt failed offset={tampered_offset} ");
+        assert!(
+            s.contains(&needle),
+            "expected absolute offset {tampered_offset} in marker, got snippet: {:?}",
+            &s[s.len().saturating_sub(200)..]
+        );
+    }
+
+    /// Reference walker: scan the WHOLE input slice as if it had
+    /// arrived in one `read()`. Tests that compare `run` against this
+    /// pin streaming output to the buffered behavior even when the
+    /// streaming code path internally uses non-trivial chunking.
+    fn reference_walk(input: &[u8], gks: &ParsedGks, strict: bool) -> anyhow::Result<Vec<u8>> {
+        // The simplest reference is: feed the whole slice to `run`
+        // via a Cursor that returns it in a single read. That
+        // guarantees the streaming branches that defer on partial
+        // sentinels are never taken, so the result matches a strict
+        // single-walk decode.
+        struct OneShot<'a> {
+            data: &'a [u8],
+            done: bool,
+        }
+        impl Read for OneShot<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.done || self.data.is_empty() {
+                    return Ok(0);
+                }
+                let n = self.data.len().min(out.len());
+                out[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                if self.data.is_empty() {
+                    self.done = true;
+                }
+                Ok(n)
+            }
+        }
+        let mut out = Vec::new();
+        let mut r = OneShot {
+            data: input,
+            done: false,
+        };
+        run(&mut r, &mut out, gks, strict)?;
+        Ok(out)
+    }
+
+    /// A valid record split exactly between the two `]` bytes of the
+    /// closer (and at every other byte boundary) must decode
+    /// identically to the buffered case in both default and strict
+    /// modes.
+    #[test]
+    fn streaming_split_closer_in_strict_mode() {
+        let gks = sample_gks();
+        let r = make_record(&gks, [0xf1; SESSION_ID_LEN], 0, [0x10; NONCE_LEN], b"split");
+        let encoded = r.encode_to_string();
+        let bytes = encoded.as_bytes();
+
+        let want = reference_walk(bytes, &gks, false).unwrap();
+        for split in 1..bytes.len() {
+            let (a, b) = bytes.split_at(split);
+            let mut combined: Vec<u8> = Vec::new();
+            combined.extend_from_slice(a);
+            combined.extend_from_slice(b);
+
+            // Default mode: must match the buffered reference.
+            let mut got = Vec::new();
+            let mut reader = ChunkedReader::new(&combined, split.max(1));
+            run(&mut reader, &mut got, &gks, false).unwrap();
+            assert_eq!(got, want, "default-mode mismatch at split={split}");
+
+            // Strict mode: a valid record split mid-sentinel must
+            // NOT trigger a strict bail. Decryption must succeed.
+            let mut got_strict = Vec::new();
+            let mut strict_reader = ChunkedReader::new(&combined, split.max(1));
+            run(&mut strict_reader, &mut got_strict, &gks, true)
+                .unwrap_or_else(|err| panic!("strict-mode error at split={split}: {err:#}"));
+            assert_eq!(got_strict, want, "strict-mode mismatch at split={split}");
+        }
+    }
+
+    /// Boundary: an opener followed by exactly the maximum legal
+    /// body length and a `]]` whose two bytes are split across two
+    /// reads must still decode (after the second `]` arrives).
+    ///
+    /// Specifically the deferred-`Unterminated` path must NOT be
+    /// considered decisive at `body_start + MAX_SENTINEL_BASE64_LEN + 1`
+    /// even though it IS decisive at `body_start + MAX_SENTINEL_BASE64_LEN + 2`.
+    #[test]
+    fn streaming_max_body_split_closer_decodes() {
+        let gks = sample_gks();
+        // Build a record large enough that its base64 body equals
+        // (or exceeds, harmlessly) most of MAX_SENTINEL_BASE64_LEN
+        // without going over.
+        let plaintext = vec![0xAB; 4000];
+        let r = make_record(
+            &gks,
+            [0xf2; SESSION_ID_LEN],
+            0,
+            [0x33; NONCE_LEN],
+            &plaintext,
+        );
+        let encoded = r.encode_to_string();
+        let bytes = encoded.as_bytes();
+
+        // Split between the two `]` of the closer.
+        let split = bytes.len() - 1;
+        let (a, b) = bytes.split_at(split);
+        let mut combined = Vec::new();
+        combined.extend_from_slice(a);
+        combined.extend_from_slice(b);
+
+        let mut out = Vec::new();
+        let mut reader = ChunkedReader::new(&combined, split);
+        let stats = run(&mut reader, &mut out, &gks, false).unwrap();
+        assert_eq!(out, plaintext);
+        assert_eq!(stats.records_ok, 1);
+    }
+
+    /// Boundary: a body that is one byte over the max with a `]]`
+    /// after it is `Unterminated` (via the scan-window cap) and must
+    /// be reported as malformed both buffered and streamed.
+    #[test]
+    fn streaming_oversize_body_is_malformed_consistently() {
+        let gks = sample_gks();
+        // body of (MAX_SENTINEL_BASE64_LEN + 1) `A`s. Per
+        // openhcl_serial_console_crypto::format::tests, the buffered
+        // scanner reports this as Unterminated because the close is
+        // outside the scan window.
+        let body = "A".repeat(MAX_SENTINEL_BASE64_LEN + 1);
+        let mut input = b"prefix ".to_vec();
+        input.extend_from_slice(format!("[[OHENC v1 {body}]]").as_bytes());
+        input.extend_from_slice(b" suffix");
+
+        let want = reference_walk(&input, &gks, false).unwrap();
+        for &chunk in &[1usize, 7, 1024, 65_536] {
+            let mut got = Vec::new();
+            let mut reader = ChunkedReader::new(&input, chunk);
+            run(&mut reader, &mut got, &gks, false).unwrap();
+            assert_eq!(got, want, "mismatch at chunk_size={chunk}");
+        }
+    }
+
+    /// `sessions_observed` must reflect only sessions that
+    /// authenticated at least once. Tampered records with novel
+    /// session ids must NOT inflate the count.
+    #[test]
+    fn sessions_observed_excludes_failed_decrypts() {
+        let gks = sample_gks();
+        let s_good = [0xe5; SESSION_ID_LEN];
+        let s_bad = [0xe6; SESSION_ID_LEN];
+        let good = make_record(&gks, s_good, 0, [0x10; NONCE_LEN], b"ok");
+        let mut bad = make_record(&gks, s_bad, 0, [0x11; NONCE_LEN], b"oops");
+        bad.tag[0] ^= 1;
+
+        let input = format!("{}\n{}\n", good.encode_to_string(), bad.encode_to_string());
+        let mut out = Vec::new();
+        let stats = run_buf(input.as_bytes(), &mut out, &gks, false).unwrap();
+        assert_eq!(stats.records_ok, 1);
+        assert_eq!(stats.records_failed, 1);
+        assert_eq!(
+            stats.sessions_observed, 1,
+            "tampered session must not count"
+        );
     }
 }

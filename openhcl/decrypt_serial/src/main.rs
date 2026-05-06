@@ -51,6 +51,11 @@ use clap::Parser;
 )]
 struct Args {
     /// Path to the encrypted serial capture to decrypt.
+    ///
+    /// Both regular files and named pipes (FIFOs) are supported. When
+    /// reading from a FIFO, decrypted output is flushed after each
+    /// record so the consumer sees plaintext live as the producer
+    /// writes encrypted records to the pipe.
     #[arg(short, long, value_name = "PATH")]
     input: std::path::PathBuf,
 
@@ -126,22 +131,28 @@ fn main() -> std::process::ExitCode {
 #[cfg(target_os = "linux")]
 fn run(args: &Args, source: &key_source::KeySource) -> anyhow::Result<decrypt::DecryptStats> {
     use anyhow::Context as _;
+    use std::io::BufReader;
     use std::io::Write as _;
 
-    let input = fs_err::read(&args.input).context("reading --input file")?;
+    // Open the input as a regular `File` so that we can stream from
+    // FIFOs and other non-seekable sources without buffering the
+    // whole capture in memory first. `BufReader` smooths over small
+    // syscall costs without changing semantics for the FIFO case.
+    let input_file = fs_err::File::open(&args.input).context("opening --input file")?;
+    let mut input = BufReader::new(input_file);
 
     let gks = pal_async::DefaultPool::run_with(async |_| key_source::resolve(source).await)
         .context("resolving key source")?;
 
     let stats = if let Some(out_path) = args.output.as_ref() {
         let mut out = fs_err::File::create(out_path).context("creating --output file")?;
-        let stats = decrypt::run(&input, &mut out, &gks, args.strict)?;
+        let stats = decrypt::run(&mut input, &mut out, &gks, args.strict)?;
         out.flush().context("flushing --output file")?;
         stats
     } else {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        let stats = decrypt::run(&input, &mut out, &gks, args.strict)?;
+        let stats = decrypt::run(&mut input, &mut out, &gks, args.strict)?;
         out.flush().context("flushing stdout")?;
         stats
     };
