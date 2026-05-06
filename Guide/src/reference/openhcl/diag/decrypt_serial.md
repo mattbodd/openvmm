@@ -51,17 +51,33 @@ will fail tag verification.
 
 ## Per-session keys
 
-The AES-256-GCM key is derived per-`session_id` from the 2048-byte
-`GUEST_SECRET_KEY` (GKS) blob in the VMGS:
+The AES-256-GCM key is derived per-`session_id` from the
+`GUEST_SECRET_KEY` (GKS) entry in VMGS slot 13 -- specifically, from
+the **structured TPM2 Import payload** that lives in that slot
+(`TPM2B_PUBLIC || TPM2B_PRIVATE || TPM2B_ENCRYPTED_SECRET`, the same
+shape `vm/devices/tpm/tpm_lib::initialize_guest_secret_key` parses
+when provisioning the L1 guest's vTPM):
 
 ```
+canonical_input =
+    object_public.serialize()  ||
+    duplicate.serialize()      ||
+    in_sym_seed.serialize()
 aes_key = KBKDF-HMAC-SHA-256(
-    key        = GKS bytes (2048),
+    key        = canonical_input,
     context    = b"OpenHCL encrypted serial console v1 AES-256-GCM key",
     salt       = session_id (16 bytes),
     output_len = 32,
 )
 ```
+
+The KDF input is **not** the raw 2048 slot bytes; it's the
+re-serialized structured payload, with no slot padding. This makes
+the derived key independent of how slot 13 happens to be padded by
+the producer or by anyone who mirrors the slot through
+`vmgstool dump`. A slot 13 entry whose contents do not parse as a
+valid TPM Import payload causes both producer and decryptor to
+fail-closed (no plaintext fallback, no garbage key).
 
 Per-session keys mean the producer is free to use either random or counter
 nonces within a session: nonce uniqueness only has to hold per-session,
@@ -69,9 +85,10 @@ not for the entire VM lifetime. The decryptor caches the derivation
 result per `session_id` so it does not re-run the KDF for every record.
 
 The shared library crate `openhcl_serial_console_crypto` (`openhcl/openhcl_serial_console_crypto/`)
-owns the wire-format and key-derivation code. The eventual producer in
-OpenHCL VTL2 will depend on the same crate, ensuring byte-for-byte
-compatibility.
+owns the wire-format, the structural parser (`gks::parse_gks`), and
+the key-derivation code. The producer in OpenHCL VTL2
+(`encrypting_serial_backend::EncryptingSerialResolver`) depends on
+the same crate, ensuring byte-for-byte compatibility.
 
 ## Usage
 
@@ -132,11 +149,23 @@ records from arbitrary plaintext using the same library code the
 decryptor consumes. **It is a developer aid only — not a sanctioned
 encrypt CLI.** The eventual VTL2 producer will live in OpenHCL itself.
 
-```sh
-# Generate a random 2 KB GKS for testing.
-head -c 2048 /dev/urandom > gks.bin
+`gks.bin` for the recipe below must be a **real TPM2 Import payload**
+(the same shape production OpenHCL provisions into VMGS slot 13).
+Arbitrary 2048 random bytes won't work: the resolver now validates
+that slot 13 contains a parseable
+`TPM2B_PUBLIC || TPM2B_PRIVATE || TPM2B_ENCRYPTED_SECRET` payload and
+fails closed otherwise.
 
-# Encrypt some plaintext.
+The simplest source of a valid sample for testing is the 422-byte
+deterministic blob in
+`vm/devices/tpm/tpm_lib/src/lib.rs:3023-3054` (the
+`GUEST_SECRET_KEY_BLOB` constant inside
+`test_initialize_guest_secret_key`). Copy those bytes into a binary
+file. For production captures you'd typically extract the GKS from
+the VM's VMGS via `vmgstool dump --fileid GUEST_SECRET_KEY` instead.
+
+```sh
+# Encrypt some plaintext (gks.bin is a real TPM Import payload).
 cargo run --example encrypt_fixture -p decrypt-serial -- \
     --key gks.bin --input my.log --output capture.txt
 
@@ -248,12 +277,13 @@ This is what the eventual petri test will automate; you can run it by
 hand today to sanity-check a build. From a Linux OpenHCL host:
 
 ```sh
-# 1. Provision a VMGS file with a known GuestSecretKey.
-head -c 2048 /dev/urandom > /tmp/gks.bin
+# 1. Provision a VMGS file with a real TPM Import payload at slot 13.
+#    Arbitrary random bytes will be rejected by the structural
+#    validator -- see "Manual round-trip" above for fixture options.
 vmgstool create   --filepath /tmp/test.vmgs
 vmgstool write    --filepath /tmp/test.vmgs \
                   --fileid   GUEST_SECRET_KEY \
-                  --datapath /tmp/gks.bin
+                  --datapath /tmp/gks.bin   # real TPM Import payload
 
 # 2. Boot OpenHCL with a Linux L1 guest, the force knob, the VMGS
 #    above, and capture the L1 COM1 stream to a file.
