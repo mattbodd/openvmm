@@ -292,6 +292,10 @@ pub struct UnderhillEnvCfg {
     pub gdbstub: bool,
     /// Hide the isolation mode from the guest.
     pub hide_isolation: bool,
+    /// Test/development knob that forces the encrypting serial
+    /// backend wrapper on for the L1 guest's COM1/COM2 even on a
+    /// non-CVM. Cannot disable encryption for a real CVM.
+    pub force_encrypted_serial_for_testing: bool,
     /// Enable nvme keep alive.
     pub nvme_keep_alive: KeepAliveConfig,
     /// Enable mana keep alive.
@@ -2309,10 +2313,23 @@ async fn new_underhill_vm(
     // (Snp / Tdx / Vbs) get encryption automatically; non-CVMs pass
     // through unchanged. The host has no flag to disable encryption
     // for a real CVM -- the host is untrusted in that scenario.
-    let encrypt_l1_serial = matches!(
+    //
+    // OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL=1 is an enable-only
+    // knob that lets non-CVM dev/test environments exercise the
+    // encrypting wrapper end-to-end. It cannot disable encryption
+    // for a real CVM.
+    let cvm_isolation = matches!(
         isolation,
         virt::IsolationType::Snp | virt::IsolationType::Tdx | virt::IsolationType::Vbs,
     );
+    let encrypt_l1_serial = cvm_isolation || env_cfg.force_encrypted_serial_for_testing;
+    if env_cfg.force_encrypted_serial_for_testing && !cvm_isolation {
+        tracing::warn!(
+            CVM_ALLOWED,
+            "OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL=1 -- forcing encrypted L1 serial \
+             on a non-CVM. This is a development / test knob; do not use in production."
+        );
+    }
 
     // Pre-extract a copy of the GKS bytes for serial encryption.
     // This leaves `platform_attestation_data.guest_secret_key`
