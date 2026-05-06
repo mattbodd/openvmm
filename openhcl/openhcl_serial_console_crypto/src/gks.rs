@@ -77,6 +77,18 @@ pub struct ParsedGks {
     pub kdf_input: Vec<u8>,
 }
 
+impl std::fmt::Debug for ParsedGks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't dump the secret bytes (or the parsed Import struct,
+        // which contains the same bytes) in Debug output. Useful
+        // for callers that propagate `anyhow::Result<ParsedGks>`
+        // through `.unwrap_err()` etc.
+        f.debug_struct("ParsedGks")
+            .field("kdf_input_len", &self.kdf_input.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Parse the contents of `FileId::GUEST_SECRET_KEY` as a TPM2
 /// Import payload and return the parsed structure together with the
 /// canonical KDF input bytes.
