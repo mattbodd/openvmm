@@ -21,3 +21,11 @@
 
 #![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
+
+mod handle;
+mod io;
+mod resolver;
+
+pub use handle::EncryptingSerialBackendHandle;
+pub use io::EncryptingSerialIo;
+pub use resolver::EncryptingSerialResolver;

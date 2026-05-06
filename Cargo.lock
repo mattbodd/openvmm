@@ -1775,6 +1775,7 @@ name = "encrypting_serial_backend"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures",
  "getrandom 0.3.3",
  "inspect",
