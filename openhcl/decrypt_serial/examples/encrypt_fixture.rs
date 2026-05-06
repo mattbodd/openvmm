@@ -13,12 +13,24 @@
 //! Usage:
 //!
 //! ```text
+//! # gks.bin must be a real TPM2 Import payload (the same shape
+//! # production OpenHCL provisions into VMGS slot 13). For testing,
+//! # you can lift the 422-byte sample from
+//! # vm/devices/tpm/tpm_lib/src/lib.rs:3023-3054 (the
+//! # GUEST_SECRET_KEY_BLOB constant in test_initialize_guest_secret_key).
 //! cargo run --example encrypt_fixture -p decrypt-serial -- \
 //!     --key gks.bin --input my.log > capture.txt
 //! cargo run -p decrypt-serial -- \
 //!     --key gks.bin --input capture.txt
 //! # output should equal my.log
 //! ```
+//!
+//! Note: arbitrary 2048 random bytes won't work as `gks.bin`
+//! anymore -- the resolver now validates that slot 13 contains a
+//! parseable TPM2 Import payload (TPM2B_PUBLIC || TPM2B_PRIVATE ||
+//! TPM2B_ENCRYPTED_SECRET) and fails closed otherwise. See the
+//! Guide page (`Guide/src/reference/openhcl/diag/decrypt_serial.md`)
+//! for how to obtain a real blob via vmgstool.
 //!
 //! The example reuses the same key-source resolution code as the
 //! decryptor, so `--vmgs <file>` works here too.
