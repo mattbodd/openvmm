@@ -208,6 +208,17 @@ pub struct Options {
     /// Hide the isolation mode from the guest.
     pub hide_isolation: bool,
 
+    /// (OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL=1)
+    /// **Test/development knob, do not use in production.** Force the
+    /// L1 guest's COM port output to be wrapped by the encrypting
+    /// serial backend even on a non-CVM, so the wire format and
+    /// decryptor can be exercised end-to-end without actually booting
+    /// a CVM. Has no effect on a real CVM (encryption is already on
+    /// by default for SNP/TDX/VBS) and CANNOT disable encryption --
+    /// the host is untrusted in that scenario, so this knob is
+    /// strictly enable-only.
+    pub force_encrypted_serial_for_testing: bool,
+
     /// (OPENHCL_HALT_ON_GUEST_HALT=1) When receiving a halt request from a
     /// lower VTL, halt underhill instead of forwarding the halt request to the
     /// host. This allows for debugging state without the partition state
@@ -396,6 +407,8 @@ impl Options {
         let serial_wait_for_rts = parse_legacy_env_bool("OPENHCL_SERIAL_WAIT_FOR_RTS");
         let nvme_vfio = parse_legacy_env_bool("OPENHCL_NVME_VFIO");
         let hide_isolation = parse_env_bool("OPENHCL_HIDE_ISOLATION");
+        let force_encrypted_serial_for_testing =
+            parse_env_bool("OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL");
         let halt_on_guest_halt = parse_legacy_env_bool("OPENHCL_HALT_ON_GUEST_HALT");
         let no_sidecar_hotplug = parse_legacy_env_bool("OPENHCL_NO_SIDECAR_HOTPLUG");
         let gdbstub = parse_legacy_env_bool("OPENHCL_GDBSTUB");
@@ -516,6 +529,7 @@ impl Options {
             force_load_vtl0_image,
             nvme_vfio,
             hide_isolation,
+            force_encrypted_serial_for_testing,
             halt_on_guest_halt,
             no_sidecar_hotplug,
             nvme_keep_alive,

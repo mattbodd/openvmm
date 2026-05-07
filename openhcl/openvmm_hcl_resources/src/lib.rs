@@ -38,6 +38,7 @@ vm_resource::register_static_resolvers! {
     // Serial ports
     serial_core::disconnected::resolver::DisconnectedSerialBackendResolver,
     vmbus_serial_guest::VmbusSerialGuestResolver,
+    encrypting_serial_backend::EncryptingSerialResolver,
 
     // Disks.
     //

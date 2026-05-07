@@ -322,6 +322,7 @@ async fn launch_workers(
         no_sidecar_hotplug: opt.no_sidecar_hotplug,
         gdbstub: opt.gdbstub,
         hide_isolation: opt.hide_isolation,
+        force_encrypted_serial_for_testing: opt.force_encrypted_serial_for_testing,
         nvme_keep_alive: opt.nvme_keep_alive,
         mana_keep_alive: opt.mana_keep_alive,
         nvme_always_flr: opt.nvme_always_flr,

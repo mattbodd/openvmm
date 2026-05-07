@@ -292,6 +292,10 @@ pub struct UnderhillEnvCfg {
     pub gdbstub: bool,
     /// Hide the isolation mode from the guest.
     pub hide_isolation: bool,
+    /// Test/development knob that forces the encrypting serial
+    /// backend wrapper on for the L1 guest's COM1/COM2 even on a
+    /// non-CVM. Cannot disable encryption for a real CVM.
+    pub force_encrypted_serial_for_testing: bool,
     /// Enable nvme keep alive.
     pub nvme_keep_alive: KeepAliveConfig,
     /// Enable mana keep alive.
@@ -2305,24 +2309,94 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
+    // Decide whether to encrypt the L1 guest's serial output. CVMs
+    // (Snp / Tdx / Vbs) get encryption automatically; non-CVMs pass
+    // through unchanged. The host has no flag to disable encryption
+    // for a real CVM -- the host is untrusted in that scenario.
+    //
+    // OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL=1 is an enable-only
+    // knob that lets non-CVM dev/test environments exercise the
+    // encrypting wrapper end-to-end. It cannot disable encryption
+    // for a real CVM.
+    let cvm_isolation = matches!(
+        isolation,
+        virt::IsolationType::Snp | virt::IsolationType::Tdx | virt::IsolationType::Vbs,
+    );
+    let encrypt_l1_serial = cvm_isolation || env_cfg.force_encrypted_serial_for_testing;
+    if env_cfg.force_encrypted_serial_for_testing && !cvm_isolation {
+        tracing::warn!(
+            CVM_ALLOWED,
+            "OPENHCL_TEST_ONLY_FORCE_ENCRYPTED_SERIAL=1 -- forcing encrypted L1 serial \
+             on a non-CVM. This is a development / test knob; do not use in production."
+        );
+    }
+
+    // Pre-extract a copy of the GKS bytes for serial encryption.
+    // This leaves `platform_attestation_data.guest_secret_key`
+    // intact for vTPM consumption further below.
+    //
+    // Fail-closed policy: if encryption is required and no GKS is
+    // available (suppressed attestation, missing VMGS entry, etc.),
+    // we leave the corresponding L1 serial slot empty and emit a
+    // CVM_ALLOWED error. The L1 guest sees no COM port at all
+    // rather than an unintentional plaintext fallback.
+    let serial_gks: Option<[u8; openhcl_serial_console_crypto::crypto::GKS_LEN]> =
+        if encrypt_l1_serial {
+            match platform_attestation_data.guest_secret_key.as_deref() {
+                Some(bytes) if !bytes.is_empty() => {
+                    let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+                    let copy_len = bytes.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                    Some(buf)
+                }
+                _ => {
+                    tracing::error!(
+                        CVM_ALLOWED,
+                        "Encrypted L1 serial console requested for this CVM but no GuestSecretKey \
+                     is available; L1 COM ports will be DISABLED rather than fall back to \
+                     plaintext on the wire. Provision a GUEST_SECRET_KEY entry in the VMGS \
+                     to enable encrypted serial."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Local helper: wrap the inner vmbus serial config in the
+    // encrypting backend handle when the policy says we should, and
+    // when we have a GKS in hand. Returns `None` when CVM serial is
+    // requested but the GKS is missing (fail-closed).
+    let wrap_l1_serial = |inner: vmbus_serial_guest::OpenVmbusSerialGuestConfig| -> Option<Resource<vm_resource::kind::SerialBackendHandle>> {
+        if encrypt_l1_serial {
+            serial_gks.map(|gks| {
+                Resource::new(encrypting_serial_backend::EncryptingSerialBackendHandle {
+                    inner: Resource::new(inner),
+                    gks,
+                })
+            })
+        } else {
+            Some(Resource::new(inner))
+        }
+    };
+
     if dps.general.com1_vmbus_redirector {
-        serial_inputs[0] = Some(Resource::new(
-            vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
-                &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM1,
-                dps.general.management_vtl_features.tx_only_serial_port(),
-            )
-            .context("failed to open com1")?,
-        ));
+        let inner = vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
+            &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM1,
+            dps.general.management_vtl_features.tx_only_serial_port(),
+        )
+        .context("failed to open com1")?;
+        serial_inputs[0] = wrap_l1_serial(inner);
     }
 
     if dps.general.com2_vmbus_redirector {
-        serial_inputs[1] = Some(Resource::new(
-            vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
-                &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM2,
-                dps.general.management_vtl_features.tx_only_serial_port(),
-            )
-            .context("failed to open com2")?,
-        ));
+        let inner = vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
+            &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM2,
+            dps.general.management_vtl_features.tx_only_serial_port(),
+        )
+        .context("failed to open com2")?;
+        serial_inputs[1] = wrap_l1_serial(inner);
     }
 
     let with_serial = serial_inputs.iter().any(|transport| transport.is_some());

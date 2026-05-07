@@ -1157,6 +1157,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "decrypt-serial"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "disk_backend",
+ "disk_vhd1",
+ "disklayer_ram",
+ "fs-err",
+ "getrandom 0.3.3",
+ "openhcl_attestation_protocol",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "vmgs",
+ "vmgs_format",
+ "zerocopy",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1746,6 +1768,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1cc3c5651fb62ab8aa3103998dade57efdd028544bd300516baa31840c252a83"
 dependencies = [
  "encoding_rs",
+]
+
+[[package]]
+name = "encrypting_serial_backend"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "getrandom 0.3.3",
+ "inspect",
+ "mesh",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "parking_lot",
+ "serial_core",
+ "thiserror 2.0.16",
+ "tracing",
+ "vm_resource",
 ]
 
 [[package]]
@@ -5115,6 +5156,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openhcl_serial_console_crypto"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "crypto",
+ "hex",
+ "thiserror 2.0.16",
+ "tpm_protocol",
+]
+
+[[package]]
 name = "openhcl_tdisp"
 version = "0.0.0"
 dependencies = [
@@ -5453,6 +5505,7 @@ dependencies = [
  "chipset_legacy",
  "debug_worker",
  "disk_striped",
+ "encrypting_serial_backend",
  "hyperv_ic",
  "mesh_worker",
  "missing_dev",
@@ -8336,6 +8389,7 @@ dependencies = [
  "disk_blockdevice",
  "disk_get_vmgs",
  "disk_nvme",
+ "encrypting_serial_backend",
  "firmware_pcat",
  "firmware_uefi",
  "firmware_uefi_custom_vars",
@@ -8389,6 +8443,7 @@ dependencies = [
  "nvme_spec",
  "openhcl_attestation_protocol",
  "openhcl_dma_manager",
+ "openhcl_serial_console_crypto",
  "pal",
  "pal_async",
  "pal_uring",
