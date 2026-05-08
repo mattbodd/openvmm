@@ -1157,6 +1157,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "decrypt-serial"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "disk_backend",
+ "disk_vhd1",
+ "disklayer_ram",
+ "fs-err",
+ "getrandom 0.3.3",
+ "openhcl_attestation_protocol",
+ "openhcl_serial_console_crypto",
+ "pal_async",
+ "tempfile",
+ "tpm_protocol",
+ "tracing",
+ "tracing-subscriber",
+ "vmgs",
+ "vmgs_format",
+ "zerocopy",
+]
+
+[[package]]
 name = "defmt"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4993,6 +5016,7 @@ dependencies = [
  "inspect",
  "kmsg",
  "mesh",
+ "openhcl_serial_console_crypto",
  "pal",
  "pal_async",
  "socket2",
@@ -5112,6 +5136,16 @@ dependencies = [
  "user_driver",
  "virt",
  "vmcore",
+]
+
+[[package]]
+name = "openhcl_serial_console_crypto"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "crypto",
+ "hex",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
@@ -8389,6 +8423,7 @@ dependencies = [
  "nvme_spec",
  "openhcl_attestation_protocol",
  "openhcl_dma_manager",
+ "openhcl_serial_console_crypto",
  "pal",
  "pal_async",
  "pal_uring",
@@ -8403,6 +8438,7 @@ dependencies = [
  "serde_helpers",
  "serde_json",
  "serial_16550_resources",
+ "serial_core",
  "socket2",
  "sparse_mmap",
  "state_unit",

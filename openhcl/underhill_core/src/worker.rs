@@ -2305,24 +2305,72 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
+    // Source the encrypted-serial GKS from the same VMGS slot that
+    // attestation already populated (`FileId::GUEST_SECRET_KEY`).
+    // The bytes are zero-padded to `GKS_LEN` to match the
+    // `read_guest_secret_key` behavior. If the slot is empty (no GSK
+    // provisioned in this VMGS) we leave serial as plaintext rather
+    // than panic — see `decrypt-serial provision-gsk` for the dev path
+    // that seeds a VMGS.
+    let encrypted_serial_gks = match platform_attestation_data.guest_secret_key.as_deref() {
+        Some(bytes) if !bytes.is_empty() => {
+            let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GKS_LEN];
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            if bytes.len() > buf.len() {
+                tracing::warn!(
+                    len = bytes.len(),
+                    expected = buf.len(),
+                    "VMGS GUEST_SECRET_KEY is longer than GKS_LEN; truncating"
+                );
+            }
+            Some(Arc::new(
+                openhcl_serial_console_crypto::crypto::GksKeyMaterial(buf),
+            ))
+        }
+        _ => {
+            tracing::info!(
+                "no GUEST_SECRET_KEY provisioned in VMGS; encrypted serial disabled (plaintext)"
+            );
+            None
+        }
+    };
+
+    if let Some(gks) = encrypted_serial_gks.clone() {
+        tracing::info!("registering encrypted serial backend resolver");
+        resolver.add_async_resolver(
+            crate::emuplat::encrypted_serial::EncryptedSerialBackendResolver { gks },
+        );
+    }
+
     if dps.general.com1_vmbus_redirector {
-        serial_inputs[0] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM1,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com1")?,
-        ));
+        );
+        serial_inputs[0] = Some(if encrypted_serial_gks.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     if dps.general.com2_vmbus_redirector {
-        serial_inputs[1] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM2,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com2")?,
-        ));
+        );
+        serial_inputs[1] = Some(if encrypted_serial_gks.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     let with_serial = serial_inputs.iter().any(|transport| transport.is_some());
