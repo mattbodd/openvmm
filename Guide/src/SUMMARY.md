@@ -83,6 +83,7 @@
     - [Network packet capture (PCAP)](./reference/openhcl/diag/ohcldiag_dev/pcap.md)
     - [Performance analysis](./reference/openhcl/diag/ohcldiag_dev/perf.md)
     - [Tracing](./reference/openhcl/diag/tracing.md)
+    - [encrypted-serial](./reference/openhcl/diag/encrypted_serial.md)
   - [Debugging](./reference/openhcl/debugging.md)
 - [Developer Features]()
   - [Hardware Debugging (gdbstub)](./reference/dev_feats/gdbstub.md)

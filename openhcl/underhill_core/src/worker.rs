@@ -277,6 +277,10 @@ pub struct UnderhillEnvCfg {
     /// If true, emulated serial should not poll data until the guest sets DTR
     /// and RTS.
     pub emulated_serial_wait_for_rts: bool,
+    /// If true, do **not** wrap the COM ports with the encrypted-serial
+    /// wrapper; let plaintext flow end-to-end. Debugging knob to
+    /// isolate `EncryptedSerialIo` from the layers underneath it.
+    pub disable_encrypted_serial: bool,
     /// Force load the specified image in VTL0. The image must support the
     /// option specified.
     ///
@@ -2305,24 +2309,84 @@ async fn new_underhill_vm(
 
     let mut serial_inputs = [None, None, None, None];
 
+    // Source the encrypted-serial GSK from the same VMGS slot that
+    // attestation already populated (`FileId::GUEST_SECRET_KEY`).
+    // The bytes are zero-padded to `GSK_LEN` to match the
+    // `read_guest_secret_key` behavior. If the slot is empty (no GSK
+    // provisioned in this VMGS) we leave serial as plaintext rather
+    // than panic — see `encrypted-serial provision-gsk` for the dev
+    // path that seeds a VMGS.
+    //
+    // Setting `OPENHCL_DISABLE_ENCRYPTED_SERIAL=1` short-circuits the
+    // VMGS lookup entirely and forces plaintext serial. Useful for
+    // debugging the underlying transport in isolation from the
+    // encryption wrapper.
+    let encrypted_serial_gsk = if env_cfg.disable_encrypted_serial {
+        tracing::info!(
+            "OPENHCL_DISABLE_ENCRYPTED_SERIAL set; skipping encrypted serial wrapper"
+        );
+        None
+    } else {
+        match platform_attestation_data.guest_secret_key.as_deref() {
+            Some(bytes) if !bytes.is_empty() => {
+                let mut buf = [0u8; openhcl_serial_console_crypto::crypto::GSK_LEN];
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if bytes.len() > buf.len() {
+                    tracing::warn!(
+                        len = bytes.len(),
+                        expected = buf.len(),
+                        "VMGS GUEST_SECRET_KEY is longer than GSK_LEN; truncating"
+                    );
+                }
+                Some(Arc::new(
+                    openhcl_serial_console_crypto::crypto::GskKeyMaterial(buf),
+                ))
+            }
+            _ => {
+                tracing::info!(
+                    "no GUEST_SECRET_KEY provisioned in VMGS; encrypted serial disabled (plaintext)"
+                );
+                None
+            }
+        }
+    };
+
+    if let Some(gsk) = encrypted_serial_gsk.clone() {
+        tracing::info!("registering encrypted serial backend resolver");
+        resolver.add_async_resolver(
+            crate::emuplat::encrypted_serial::EncryptedSerialBackendResolver { gsk },
+        );
+    }
+
     if dps.general.com1_vmbus_redirector {
-        serial_inputs[0] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM1,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com1")?,
-        ));
+        );
+        serial_inputs[0] = Some(if encrypted_serial_gsk.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     if dps.general.com2_vmbus_redirector {
-        serial_inputs[1] = Some(Resource::new(
+        let inner = Resource::new(
             vmbus_serial_guest::OpenVmbusSerialGuestConfig::open(
                 &vmbus_serial_guest::UART_INTERFACE_INSTANCE_COM2,
                 dps.general.management_vtl_features.tx_only_serial_port(),
             )
             .context("failed to open com2")?,
-        ));
+        );
+        serial_inputs[1] = Some(if encrypted_serial_gsk.is_some() {
+            Resource::new(crate::emuplat::encrypted_serial::EncryptedSerialBackendHandle { inner })
+        } else {
+            inner
+        });
     }
 
     let with_serial = serial_inputs.iter().any(|transport| transport.is_some());
